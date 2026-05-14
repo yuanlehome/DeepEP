@@ -170,3 +170,54 @@ recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
 ```
 
 使用可配置宽度整数类型的目的：当 expert 总数较少（< 32768）时，可改用 `int16_t`，减少通信缓冲区占用和带宽开销。
+
+---
+
+## Q4：`csrc/kernels` 中的 kernels 实现与 `deep_ep/include/deep_ep/impls` 下的 kernels 实现有什么区别？
+
+**问题**
+
+`csrc/kernels` 中也有 kernel 相关代码，`deep_ep/include/deep_ep/impls` 下也有 dispatch、combine、barrier 等 kernel 实现。两者分别承担什么职责？
+
+**答案**
+
+核心区别是：`csrc/kernels` 更偏宿主侧封装、运行时入口和历史实现；`deep_ep/include/deep_ep/impls` 则是 elastic 路径下真正的 CUDA kernel 模板实现。
+
+### `csrc/kernels/elastic/*.hpp`
+
+这部分是 elastic kernels 的 C++ host/JIT wrapper，主要负责：
+
+- 根据运行时参数拼接模板参数
+- 生成一段包含 `#include <deep_ep/impls/*.cuh>` 的 JIT 源码
+- 调用 `jit::compiler->build(...)` 编译 kernel
+- 通过 `jit::launch_kernel(...)` 启动 kernel
+
+例如 `csrc/kernels/elastic/dispatch.hpp` 中，`DispatchRuntime::generate_impl` 会根据 `num_scaleout_ranks` 选择 `dispatch.cuh` 或 `hybrid_dispatch.cuh`，并实例化对应的 dispatch / hybrid dispatch 函数模板。
+
+### `deep_ep/include/deep_ep/impls/*.cuh`
+
+这部分是真正的设备端 CUDA kernel 实现，包含具体通信和数据搬运逻辑，例如：
+
+- token 到 rank / expert 的计数与 prefix sum
+- slot 分配与 metadata 写入
+- TMA load / store
+- NCCL Gin put / get_sym_ptr
+- GPU barrier、notify、epilogue 等
+
+以 `deep_ep/include/deep_ep/impls/dispatch.cuh` 为例，里面定义的 `__global__ void dispatch_impl(...)` 才是真正执行 dispatch 的 kernel。
+
+### `csrc/kernels/legacy` 与 `backend`
+
+`csrc/kernels/legacy` 是 DeepEP V1 / NVSHMEM-based 的旧实现，属于另一套路径，命名空间是 `deep_ep::legacy`，和 elastic 的 JIT wrapper + `impls` 结构不同。
+
+`csrc/kernels/backend` 则是运行时支撑层，包含 NCCL、NVSHMEM、CUDA driver 等封装，不是 dispatch / combine kernel 的主体实现。
+
+### 总结
+
+可以按下面方式理解：
+
+- `csrc/kernels/elastic/*.hpp`：host 侧 JIT 封装层，负责生成、编译、启动 kernel
+- `deep_ep/include/deep_ep/impls/*.cuh`：device 侧 kernel 实现层，负责真正的 GPU 执行逻辑
+- `csrc/kernels/legacy`：旧版 V1 独立实现
+- `csrc/kernels/backend`：通信和驱动 runtime 支撑层
+
