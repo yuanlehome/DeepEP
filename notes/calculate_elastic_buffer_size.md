@@ -417,35 +417,36 @@ return std::max(num_dispatch_bytes, num_combine_bytes);
 ## 十一、数值示例
 
 假设典型配置：
-- `hidden = 7168`，`num_topk = 8`，BF16 dispatch
+- `hidden = 7168`，`num_topk = 8`，BF16 dispatch（`elem_size = sizeof(nv_bfloat16) = 2`）
 - 8 GPU/节点 × 4 节点 = 32 ranks，`allow_hybrid_mode = true`
+- `num_scaleup_ranks = num_nvl_ranks = 8`，`num_scaleout_ranks = num_rdma_ranks = 4`
 - `num_max_tokens_per_rank = 512`
 
 **Token bytes（Dispatch，BF16）**：
-- `num_hidden_bytes = 7168 * 2 = 14336`（已经 32B 对齐）
-- `num_sf_bytes = 0`（BF16 无 scale factor）
-- `num_metadata_bytes = 8*(4+4) + (1+8)*4 = 64 + 36 = 100` → align(100, 32) = 128
-- `token_bytes = 14336 + 0 + 128 = 14464`
+- `num_hidden_bytes = hidden * elem_size = 7168 * 2 = 14336`（已经 32B 对齐）
+- `num_sf_bytes = num_sf_packs * sizeof(float) = 0 * 4 = 0`（BF16 无 scale factor，`num_sf_packs = 0`）
+- `num_metadata_bytes = num_topk * (sizeof(int) + sizeof(float)) + (1 + num_topk) * sizeof(int) = 8*(4+4) + (1+8)*4 = 64 + 36 = 100` → `align(100, 32) = 128`
+- `token_bytes = align(num_hidden_bytes, 32) + align(num_sf_bytes, 32) + align(num_metadata_bytes, 32) = 14336 + 0 + 128 = 14464`
 
 **Dispatch（Hybrid 模式）**：
-- `scaleup_recv = 14464 * 8 * (4 * 512) = 14464 * 8 * 2048 = 236,978,176`
-- `scaleout_send = 14464 * 1 * 512 = 7,405,568`
-- `scaleout_recv = 14464 * 4 * (512 + 1280) = 14464 * 4 * 1792 = 103,612,416`
-- **Dispatch Total ≈ 348 MB**
+- `scaleup_recv = token_bytes * num_scaleup_ranks * (num_scaleout_ranks * num_max_tokens_per_rank) = 14464 * 8 * (4 * 512) = 14464 * 8 * 2048 = 236,978,176`
+- `scaleout_send = token_bytes * 1 * num_max_tokens_per_rank = 14464 * 1 * 512 = 7,405,568`
+- `scaleout_recv = token_bytes * num_scaleout_ranks * (num_max_tokens_per_rank + kNumMaxChannels) = 14464 * 4 * (512 + 1280) = 14464 * 4 * 1792 = 103,612,416`
+- **Dispatch Total = scaleup_recv + scaleout_send + scaleout_recv ≈ 348 MB**
 
 **Token bytes（Combine，BF16）**：
-- `num_hidden_bytes = 7168 * 2 = 14336`
-- `num_sf_bytes = 0`
-- `num_metadata_bytes = 8*(4+4) = 64` → align(64, 32) = 64
-- `token_bytes = 14336 + 0 + 64 = 14400`
+- `num_hidden_bytes = hidden * sizeof(nv_bfloat16) = 7168 * 2 = 14336`
+- `num_sf_bytes = 0`（combine 不需要 scale factor）
+- `num_metadata_bytes = num_topk * (sizeof(int) + sizeof(float)) = 8*(4+4) = 64` → `align(64, 32) = 64`
+- `token_bytes = align(num_hidden_bytes, 32) + align(num_sf_bytes, 32) + align(num_metadata_bytes, 32) = 14336 + 0 + 64 = 14400`
 
 **Combine（Hybrid，multiple_reduction=true）**：
-- `scaleup_recv = 14400 * min(8,8) * (4 * 512) = 14400 * 8 * 2048 = 235,929,600`
-- `scaleout_recv = 14400 * min(4,8) * 512 = 14400 * 4 * 512 = 29,491,200`
-- `scaleout_send = 14400 * 1 * 4 * (512 + 1280) = 14400 * 4 * 1792 = 103,219,200`
-- **Combine Total ≈ 368 MB**
+- `scaleup_recv = token_bytes * min(num_scaleup_ranks, num_topk) * (num_scaleout_ranks * num_max_tokens_per_rank) = 14400 * min(8,8) * (4 * 512) = 14400 * 8 * 2048 = 235,929,600`
+- `scaleout_recv = token_bytes * min(num_scaleout_ranks, num_topk) * num_max_tokens_per_rank = 14400 * min(4,8) * 512 = 14400 * 4 * 512 = 29,491,200`
+- `scaleout_send = token_bytes * 1 * num_scaleout_ranks * (num_max_tokens_per_rank + kNumMaxChannels) = 14400 * 1 * 4 * (512 + 1280) = 14400 * 4 * 1792 = 103,219,200`
+- **Combine Total = scaleup_recv + scaleout_send + scaleout_recv ≈ 368 MB**
 
-**最终结果** = `max(348MB, 368MB)` ≈ **368 MB**
+**最终结果** = `max(Dispatch Total, Combine Total) = max(348MB, 368MB)` ≈ **368 MB**
 
 ---
 

@@ -389,3 +389,164 @@ torch.cuda.synchronize()
 - 缺第一次 sync：可能在本地 GPU 未就绪时就声称就绪，对端 RDMA 写入写到未注册完成的内存
 - 缺 barrier：无法确认其他 rank 是否就绪，可能向未初始化的 peer 发通信
 - 缺第二次 sync：barrier 的 NCCL kernel 还在跑时后续操作就开始了，产生 stream 竞争
+
+---
+
+## Q9：FP8 量化中为什么是"每 32 个元素一个 scale factor"？
+
+**问题**
+
+`calculate_elastic_buffer_size` 中计算 SF 开销用的是 `ceil_div(hidden, 32)`，为什么分组粒度恰好是 32？
+
+**答案**
+
+### FP8 的精度局限
+
+FP8（E4M3）只有 4 bit 指数，动态范围极窄。如果对整个 hidden 维度只用一个 scale factor，量化误差会非常大。业界通用做法是 **per-group quantization**（分组量化），每组独立维护一个 FP32 scale factor 来记录数值尺度。
+
+### 为什么是 32
+
+三个因素共同决定了这个粒度：
+
+1. **与 TMA 对齐粒度匹配**：`kNumTMAAlignBytes = 32`，32 个 FP8 元素正好 32 字节，满足一次 TMA 加载的最小对齐单元。
+2. **Warp 内并行**：一个 warp 32 个线程，每线程处理 1 个元素 + 共享 1 个 scale factor，无需跨 warp 通信。
+3. **精度-开销折中**：overhead = `4 / (32×1) = 12.5%`，即 SF 额外字节占主数据的比例，处于可接受范围。
+
+这实际上对应 NVIDIA 的 **microscaling（MX）格式** 中 block size = 32 的设计。
+
+### 代码中的验证
+
+```cpp
+// csrc/elastic/buffer.hpp:603
+EP_HOST_ASSERT(math::ceil_div(hidden, 32) * sizeof(float) <= hidden);
+```
+
+该 assert 确保 SF 总字节 ≤ 主数据字节（FP8 下 `hidden_bytes = hidden * 1`），对 hidden ≥ 4 恒成立，是 sanity check。
+
+---
+
+## Q10：DeepEP 中 Channel 的概念如何理解？
+
+**问题**
+
+`kNumMaxChannelsPerSM = 8`，"每个 SM 最大 channel 数"，这里的 channel 是什么？
+
+**答案**
+
+### 本质定义
+
+**一个 channel = 一个 warp = 一条独立的 token 传输流水线**。
+
+Channel 只存在于 **hybrid 模式**（跨节点 RDMA + 节点内 NVLink 两级通信）中，解决的是跨节点通信的流水线并行问题。
+
+### 代码中的对应关系
+
+```cpp
+// deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh:56
+// NOTES: a warp is a channel (different channels may share QPs)
+const auto channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
+```
+
+### 层次结构
+
+```
+一个 Kernel Block（占据 1 个 SM）
+├── Notify warps（4~8 个，处理元数据信号）
+├── Scaleout warps × N（N = num_channels_per_sm）
+│     └── 每个 warp = 1 个 channel，负责与远端节点的 RDMA 数据收发
+└── Forward warps × N
+      └── 每个 warp = 1 个 channel，负责将收到的数据转发到节点内目标 GPU
+```
+
+### 每个 channel 独立维护的资源
+
+- 独立的 **buffer 分区**：`scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx)`
+- 独立的 **尾指针**（tail pointer）：追踪接收进度，无锁推进
+- 独立的 **linked list**：记录 token 在 combine 阶段的路由链表
+
+### Channel 数量的约束
+
+```cpp
+// csrc/elastic/buffer.hpp:759-779
+num_channels_per_sm = min(
+    (shared_memory - notify区) / token_bytes,   // shared memory 容量约束
+    (32 - notify_warps) / 2,                     // warp 预算（scaleout + forward 各半）
+    kNumMaxChannelsPerSM                         // 硬上限 8
+);
+num_channels = num_sms * num_channels_per_sm;
+```
+
+### 为什么需要 channel
+
+- **无 channel**：一个 SM 串行处理所有跨节点 token，RDMA 延迟成为瓶颈
+- **有 channel**：多个 channel 并行处理不同 token 子集，重叠通信与转发，类似多级流水线
+
+### 与 buffer size 的关系
+
+```cpp
+// scaleout_recv_buffer 多预留 kNumMaxChannels 个 token 槽位
+num_max_tokens_per_rank + kNumMaxChannels   // 1280 = 8 × 160
+```
+
+每个 channel 需要独立 buffer 区域以避免竞争，总共最多 1280 个 channel，每个需要 1 个 token 的尾部 padding。
+
+---
+
+## Q11：B200（Blackwell）与 H100（Hopper）的 SM/Warp 硬件配置对比
+
+**问题**
+
+B200 的 SM、channel、warp 等硬件配置是什么？
+
+**答案**
+
+### 核心规格对比
+
+| 参数 | B200 (Blackwell) | H100 (Hopper) |
+|------|------------------|---------------|
+| 物理 SM 数 | 160 (2×80/die) | 132 |
+| 启用 SM 数 | 148 (2×74/die) | 132 |
+| Die 架构 | 双 chiplet | 单片 |
+| CUDA Cores/SM | 128 | 128 |
+| 最大并发 Warp/SM | **64** | 48 |
+| Warp size（线程/warp） | 32 | 32 |
+| 最大线程/SM | 2048 | 1536 |
+| Shared Memory/SM | 228 KB | 228 KB |
+| 寄存器文件/SM | 256 KB (64K×32bit) | 256 KB |
+| Tensor Memory/SM | **256 KB（新增）** | 无 |
+| NVLink 带宽/GPU | 1800 GB/s | 900 GB/s |
+| HBM 容量 | 192 GB HBM3e | 80 GB HBM3 |
+| 显存带宽 | 8 TB/s | 3.35 TB/s |
+| L2 Cache | 192 MB | 50 MB |
+| TDP | 1000 W | 700 W |
+
+### 与 DeepEP 常量的对应
+
+```cpp
+static constexpr int kNumMaxSMs = 160;            // B200 物理 SM 上限（2×80）
+static constexpr int kNumMaxChannelsPerSM = 8;    // 每 SM 最多 8 channel
+static constexpr int kNumMaxChannels = 1280;      // 160 × 8
+```
+
+`kNumMaxSMs = 160` 取的是物理 SM 上限而非启用数 148，确保 buffer 对任何 SKU 都够用。
+
+### B200 相比 H100 的关键优势
+
+- **Warp 容量多 33%**（64 vs 48）：理论上可支持更多 channel/SM，但 shared memory 不变，实际瓶颈仍在 smem
+- **NVLink 带宽翻倍**（1.8 TB/s vs 0.9 TB/s）：scaleup 域（节点内）通信吞吐直接翻倍
+- **HBM 带宽翻倍+**（8 TB/s vs 3.35 TB/s）：buffer 读写更快，channel 不易被显存带宽卡住
+- **L2 Cache 翻近 4 倍**（192 MB vs 50 MB）：workspace 元数据更容易命中 L2，减少 HBM 访问
+- **HBM 容量翻倍+**（192 GB vs 80 GB）：可容纳更大的通信 buffer，支持更多 token/rank 或更大 hidden
+- **Tensor Memory（TMEM）256 KB/SM**：新增的 SM 本地存储，Tensor Core 可直接读写，减少 smem 压力
+- **双 chiplet 架构**：2×80 SM 通过 10 TB/s 片间互联组成单一逻辑 GPU，晶体管数从 80B 翻到 208B
+- **FP4 支持**：新增 FP4 精度（20 PFLOPS），未来通信 buffer 可进一步压缩
+
+### B200 对 DeepEP channel 机制的具体影响
+
+| 维度 | H100 | B200 | 影响 |
+|------|------|------|------|
+| Warp/SM | 48 | 64 | channel 上限不受 warp 约束（瓶颈在 smem） |
+| Shared Memory | 228 KB | 228 KB | channel/SM 的实际上限不变 |
+| NVLink BW | 900 GB/s | 1800 GB/s | 每个 scaleup channel 的有效带宽翻倍 |
+| HBM BW | 3.35 TB/s | 8 TB/s | buffer 读写吞吐翻倍，减少 channel 空等 |
+| L2 | 50 MB | 192 MB | workspace 尾指针/信号等热数据更易缓存 |
