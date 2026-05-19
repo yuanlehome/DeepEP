@@ -221,3 +221,171 @@ recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
 - `csrc/kernels/legacy`：旧版 V1 独立实现
 - `csrc/kernels/backend`：通信和驱动 runtime 支撑层
 
+---
+
+## Q5：`EventHandle` 和 `EventOverlap` 的区别是什么？
+
+**问题**
+
+`elastic.py` 中同时 import 了 `EventHandle`（来自 C++ 扩展）和 `EventOverlap`（来自 `deep_ep/utils/event.py`），两者有什么区别？
+
+**答案**
+
+### `EventHandle`（C++ 层，`csrc/utils/event.hpp`）
+
+底层 C++ struct，直接封装 CUDA event 的核心操作：
+
+- 持有 `std::shared_ptr<torch::Event>`，即实际的 CUDA event
+- 持有 `tensors_to_record`，保持 tensor 引用计数，防止异步通信期间被提前释放
+- 构造时自动在当前/指定 stream 上 `record` event
+- 提供 `current_stream_wait()` 让当前 stream 等待该 event 完成
+
+本质是一个轻量的 CUDA event 句柄。
+
+### `EventOverlap`（Python 层，`deep_ep/utils/event.py`）
+
+Python wrapper 类，围绕 `EventHandle` 提供更高层的使用便利性：
+
+- 内部持有一个 `EventHandle` 实例（`self.event`）
+- 额外持有 `extra_tensors` 模拟 `record_stream`（兼容 CUDA Graph）
+- 实现 context manager（`__enter__`/`__exit__`），支持 `with` 语法做计算与通信 overlap
+- 提供 `release_handle` 机制，退出时可选择释放底层 event 引用
+
+### 关系总结
+
+- `EventHandle` 是"事件本身"
+- `EventOverlap` 是"用事件做 overlap 的工具类"，包装了 `EventHandle`
+
+---
+
+## Q6：`weak_lru` 的实现原理是什么？
+
+**问题**
+
+`deep_ep/utils/semantic.py` 中的 `weak_lru` 装饰器是什么？为什么不直接用 `functools.lru_cache`？
+
+**答案**
+
+### 问题背景
+
+直接对实例方法使用 `@functools.lru_cache`，`self` 会被缓存强引用，导致实例永远无法被 GC 回收，造成内存泄漏。
+
+### 实现机制
+
+核心思路是用 `weakref.ref(self)` 替代 `self` 作为缓存的 key：
+
+```python
+def weak_lru(maxsize=128, typed=False):
+    def wrapper(func):
+        @functools.lru_cache(maxsize, typed)
+        def _func(_self, *args, **kwargs):
+            return func(_self(), *args, **kwargs)   # _self() 解引用 weakref
+
+        @functools.wraps(func)
+        def inner(self, *args, **kwargs):
+            return _func(weakref.ref(self), *args, **kwargs)  # 传入弱引用
+
+        return inner
+    return wrapper
+```
+
+### 为什么能避免内存泄漏
+
+- `weakref.ref(self)` 不增加 `self` 的引用计数
+- 当实例被销毁后，弱引用失效，缓存不会阻止 GC 回收
+- 对比直接 `lru_cache`：`self` 被缓存字典强引用 → 实例永远不会被 GC
+
+### 在 DeepEP 中的用途
+
+用于 `ElasticBuffer.get_theoretical_num_sms` 方法，缓存 SM 数估算结果。Buffer 持有大量 GPU 显存，`weak_lru` 保证缓存是 Buffer 的附属品，不会反过来控制 Buffer 的生命周期。
+
+### 为什么 Python 标准库不提供 `weak_lru`？
+
+- `lru_cache` 最初设计给纯函数用，方法缓存是衍生用法
+- 不是所有对象都支持 `weakref`（如 `int`、`str`、部分 `__slots__` 类）
+- 实例被 GC 后缓存命中的语义不统一（抛异常？重算？返回 None？）
+- 20 行代码即可实现，社区认为不值得加入标准库维护负担
+
+---
+
+## Q7：`num_recv_tokens` 是去重前还是去重后的数？`psum` 的 offset 用于哪个对象？
+
+**问题**
+
+`EPHandle.num_recv_tokens` 表示的 token 数是去重前还是去重后的？`align(psum[i], expert_alignment)` 给出的 offset 是用来索引什么对象的？
+
+**答案**
+
+### `num_recv_tokens` 的去重语义
+
+取决于 `do_expand` 模式：
+
+- **非 expand 模式（`do_expand=False`）**：**去重后**的数量。同一 token 即使有多个 top-k expert 落在同一 rank，只发送/接收一次。
+- **Expand 模式（`do_expand=True`）**：**去重前（展开后）**的数量。每个 token-expert 对都有独立槽位。
+
+### `align(psum[i], expert_alignment)` 的 offset 用途
+
+用于索引 **`recv_x` tensor**（接收到的 token hidden states），切分出每个 local expert 的输入片段：
+
+```python
+start_i = align(psum[i-1], expert_alignment)   # expert i 在 recv_x 中的起始行
+end_i   = start_i + real_count[i]              # 实际有效行数
+expert_i_tokens = recv_x[start_i : end_i]      # 送入 expert i 做 FFN
+```
+
+对齐是为了满足 CUDA kernel 向量化访问要求。
+
+### `recv_x` 的真实数据形态
+
+```
+recv_x: shape = [num_recv_tokens, hidden], dtype = bf16 或 fp8
+```
+
+行按 local expert 分段排列，段间有 padding（由 `expert_alignment` 决定）。FP8 情况下 `recv_x` 是 tuple `(data, scale_factor)`。
+
+本质上就是：从各 rank 收集来的、需要由本 rank expert 处理的 token embedding 矩阵。
+
+---
+
+## Q8：`__init__` 末尾的三行同步（`synchronize` → `barrier` → `synchronize`）为什么需要三步？
+
+**问题**
+
+`elastic.py`：
+
+```python
+torch.cuda.synchronize()
+group.barrier()
+torch.cuda.synchronize()
+```
+
+为什么要执行这三行？`cuda.synchronize()` 为什么要调两次？
+
+**答案**
+
+### 目的
+
+确保**所有 rank 都完成了 runtime 初始化后，才允许任何 rank 发起通信**。CPU 和 GPU 是异步的，单独一次 `synchronize` 或 `barrier` 都不够。
+
+### 逐行解释
+
+1. **第一次 `torch.cuda.synchronize()`**：等待本地 GPU 上所有排队操作完成（如 CUDA memory 注册、NVLink mapping 等异步提交的初始化操作）。保证本 rank 的 GPU 资源确实准备好了，再告诉别人"我就绪了"。
+
+2. **`group.barrier()`**：CPU 级别的集体同步——所有 rank 都执行完第一次 sync 后才能通过。建立全局 happens-before：通过 barrier 后，每个 rank 都可以确信所有 peer 的 GPU 资源已就绪。
+
+3. **第二次 `torch.cuda.synchronize()`**：`group.barrier()` 内部可能使用 NCCL allreduce 实现（NCCL 操作会提交 GPU kernel）。第二次 sync 确保 barrier 的 GPU 侧工作也完成，后续 CUDA 操作不会与 barrier 内部 kernel 竞争。
+
+### 时间线
+
+```
+① sync  → 保证本 rank GPU 初始化完成
+② barrier → 保证所有 rank 都完成了 ①
+③ sync  → 保证 barrier 本身的 GPU 操作也完成
+─── 此后任何 rank 发起通信都是安全的 ───
+```
+
+### 为什么缺一不可
+
+- 缺第一次 sync：可能在本地 GPU 未就绪时就声称就绪，对端 RDMA 写入写到未注册完成的内存
+- 缺 barrier：无法确认其他 rank 是否就绪，可能向未初始化的 peer 发通信
+- 缺第二次 sync：barrier 的 NCCL kernel 还在跑时后续操作就开始了，产生 stream 竞争
